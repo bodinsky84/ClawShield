@@ -2,12 +2,6 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function computeRisk(score) {
-  if (score >= 70) return "HIGH";
-  if (score >= 35) return "MEDIUM";
-  return "LOW";
-}
-
 function uniq(arr) {
   return [...new Set((arr || []).filter(Boolean))];
 }
@@ -22,90 +16,221 @@ function normalizeDomains(list) {
   );
 }
 
-function scanText(text) {
+function computeRisk(score, thresholds) {
+  const { medium = 35, high = 70 } = thresholds || {};
+  if (score >= high) return "HIGH";
+  if (score >= medium) return "MEDIUM";
+  return "LOW";
+}
+
+function getPackConfig(pack) {
+  const p = (pack || "basic").toLowerCase();
+  if (p === "strict") {
+    return {
+      name: "STRICT",
+      thresholds: { medium: 28, high: 55 },
+      multiplier: 1.15,
+      enabled: "all"
+    };
+  }
+  if (p === "paranoid") {
+    return {
+      name: "PARANOID",
+      thresholds: { medium: 22, high: 45 },
+      multiplier: 1.3,
+      enabled: "all_plus"
+    };
+  }
+  return {
+    name: "BASIC",
+    thresholds: { medium: 35, high: 70 },
+    multiplier: 1.0,
+    enabled: "core"
+  };
+}
+
+function findMatchesByLine(text, regexes, maxMatches = 8) {
+  const lines = String(text || "").split(/\r?\n/);
+  const matches = [];
+  for (let i = 0; i < lines.length; i++) {
+    const lineText = lines[i];
+    for (const rx of regexes) {
+      try {
+        if (rx.test(lineText)) {
+          matches.push({ line: i + 1, text: lineText.slice(0, 240) });
+          break;
+        }
+      } catch {}
+    }
+    if (matches.length >= maxMatches) break;
+  }
+  return matches;
+}
+
+function extractDomainsFromText(text) {
   const t = String(text || "");
+  const urlMatches = t.match(/\bhttps?:\/\/[^\s'")]+/gi) || [];
+  const extracted = [];
+  for (const u of urlMatches.slice(0, 20)) {
+    try {
+      extracted.push(new URL(u).hostname);
+    } catch {}
+  }
+  return normalizeDomains(extracted);
+}
 
-  const findings = [];
-  let score = 0;
+function scanText(text, packName) {
+  const t = String(text || "");
+  const pack = getPackConfig(packName);
 
-  const rules = [
+  const CORE_RULES = [
     {
       id: "remote_pipe_to_shell",
       severity: "HIGH",
-      points: 55,
-      test: (s) => /\b(curl|wget)\b[\s\S]{0,120}\|\s*(bash|sh|zsh|pwsh|powershell)\b/i.test(s),
+      basePoints: 55,
+      regexes: [
+        /\b(curl|wget)\b[\s\S]{0,120}\|\s*(bash|sh|zsh|pwsh|powershell)\b/i
+      ],
       title: "Pipes remote content to a shell",
-      detail: "Patterns like `curl ... | bash` are a common malware delivery mechanism. Prefer download + verify + run."
+      simple: "Det här är en klassisk “ladda ner och kör direkt”-risk (kan installera malware).",
+      dev: "Detected pattern like `curl/wget ... | bash/sh/powershell`. Prefer download + checksum/signature verification + manual execution."
     },
     {
       id: "sudo_or_admin",
       severity: "MEDIUM",
-      points: 18,
-      test: (s) => /\bsudo\b|runas\b|start-process\b.*-verb\s+runas/i.test(s),
+      basePoints: 18,
+      regexes: [/\bsudo\b/i, /-verb\s+runas/i, /\brunas\b/i],
       title: "Uses elevated privileges",
-      detail: "Admin rights increase blast radius. Prefer least-privilege sandbox and explicit approval gates."
+      simple: "Försöker köra med admin-rättigheter → större skada om något är fel.",
+      dev: "Elevation request detected (sudo/RunAs). Enforce least privilege + explicit approval gates."
     },
     {
       id: "destructive_rm",
       severity: "HIGH",
-      points: 45,
-      test: (s) => /\brm\s+-rf\b|\bdel\s+\/f\b|\bformat\b|\bmkfs\./i.test(s),
+      basePoints: 45,
+      regexes: [/\brm\s+-rf\b/i, /\bmkfs\./i, /\bformat\b/i, /\bdel\s+\/f\b/i],
       title: "Potentially destructive delete/format commands",
-      detail: "Detected destructive patterns. Block these in agent execution policies."
+      simple: "Kan radera eller förstöra data. Blockera detta i en agent.",
+      dev: "Destructive patterns detected (rm -rf / mkfs / format / del /f). Should be denied by default."
     },
     {
       id: "credential_hunting",
       severity: "HIGH",
-      points: 40,
-      test: (s) =>
-        /\b(openai_api_key|api[_-]?key|secret|token|password)\b/i.test(s) ||
-        /~\/\.ssh|id_rsa|authorized_keys|\.aws\/credentials|\.env\b/i.test(s),
+      basePoints: 40,
+      regexes: [
+        /\b(openai_api_key|api[_-]?key|secret|token|password)\b/i,
+        /~\/\.ssh/i,
+        /id_rsa/i,
+        /\.aws\/credentials/i,
+        /\b\.env\b/i
+      ],
       title: "Possible credential or secret access",
-      detail: "Access to `.env`, SSH keys, cloud credentials, or secrets suggests credential-hunting. Require explicit consent + redaction."
+      simple: "Försöker läsa nycklar/hemligheter (t.ex. .env eller ssh-nycklar).",
+      dev: "Potential secrets access detected (.env, ~/.ssh, cloud creds, secret keywords). Require explicit consent + redaction."
     },
     {
       id: "env_dump",
       severity: "MEDIUM",
-      points: 18,
-      test: (s) => /\bprintenv\b|\benv\b(?!ironment)|process\.env|os\.environ/i.test(s),
+      basePoints: 18,
+      regexes: [/\bprintenv\b/i, /\bprocess\.env\b/i, /\bos\.environ\b/i, /\benv\b(?!ironment)/i],
       title: "Reads environment variables",
-      detail: "Dumping environment variables can expose secrets. Restrict or redact sensitive keys."
+      simple: "Kan råka läcka hemligheter från miljövariabler.",
+      dev: "Environment variable access detected (printenv/process.env/os.environ). Redact sensitive keys."
     },
     {
       id: "network_exfil",
       severity: "MEDIUM",
-      points: 16,
-      test: (s) => /\b(nc|netcat|socat)\b|\bscp\b|\bcurl\b|\bwget\b|\binvoke-webrequest\b/i.test(s),
+      basePoints: 16,
+      regexes: [/\b(nc|netcat|socat)\b/i, /\bscp\b/i, /\bcurl\b/i, /\bwget\b/i, /\binvoke-webrequest\b/i],
       title: "Network-capable commands present",
-      detail: "Network tooling can be used for exfiltration or downloading payloads. Prefer domain allowlists."
+      simple: "Nätverk kan användas för att skicka ut data eller hämta payloads.",
+      dev: "Network tooling detected. Restrict egress and use domain allowlists."
     },
     {
-      id: "code_download_execute",
+      id: "inline_exec_flags",
       severity: "HIGH",
-      points: 30,
-      test: (s) => /\bpython\b[\s\S]{0,40}-c\b|\bnode\b[\s\S]{0,40}-e\b|\bpowershell\b[\s\S]{0,40}-enc\b/i.test(s),
-      title: "Inline code execution flags detected",
-      detail: "Inline execution can hide behavior. Consider blocking or requiring approval."
+      basePoints: 30,
+      regexes: [/\bpython\b.*\s-c\b/i, /\bnode\b.*\s-e\b/i, /\bpowershell\b.*\s-enc\b/i],
+      title: "Inline / encoded execution flags detected",
+      simple: "Kör kod “inline”/kodat → svårt att se vad som händer.",
+      dev: "Inline execution flags detected (python -c, node -e, powershell -enc). Often used to hide behavior."
     },
     {
       id: "persistence",
       severity: "MEDIUM",
-      points: 16,
-      test: (s) => /\b(crontab|launchctl|systemctl\s+enable|schtasks|registry|reg\s+add)\b/i.test(s),
+      basePoints: 16,
+      regexes: [/\bcrontab\b/i, /\blaunchctl\b/i, /\bsystemctl\s+enable\b/i, /\bschtasks\b/i, /\breg\s+add\b/i],
       title: "Possible persistence mechanisms",
-      detail: "Persistence should be tightly controlled in any agent runner."
+      simple: "Försöker göra sig “permanent” (cron/service/scheduled task).",
+      dev: "Persistence indicators detected (cron/services/scheduled tasks/registry). Should require approval."
     }
   ];
 
-  for (const r of rules) {
-    if (r.test(t)) {
-      findings.push({ title: r.title, severity: r.severity, detail: r.detail, ruleId: r.id, points: r.points });
-      score += r.points;
+  const EXTRA_RULES = [
+    {
+      id: "base64_obfuscation",
+      severity: "MEDIUM",
+      basePoints: 22,
+      regexes: [/\bbase64\b/i, /frombase64string/i, /\batob\(/i],
+      title: "Possible obfuscation / base64 decoding",
+      simple: "Ser ut som att text/kod avkodas (kan dölja en payload).",
+      dev: "Base64/obfuscation indicators detected (base64/FromBase64String/atob). Consider decoding in a safe viewer and scanning output."
+    },
+    {
+      id: "eval_like",
+      severity: "HIGH",
+      basePoints: 28,
+      regexes: [/\beval\(/i, /\bexec\(/i, /\bFunction\(/i],
+      title: "Dynamic execution (eval/exec)",
+      simple: "Kör dynamisk kod (svårt att kontrollera).",
+      dev: "Dynamic execution detected (eval/exec/Function). High-risk in agent contexts; block or require approval."
+    },
+    {
+      id: "npm_postinstall",
+      severity: "MEDIUM",
+      basePoints: 20,
+      regexes: [/\bpostinstall\b/i, /\bnpm\s+install\b/i, /\byarn\s+add\b/i, /\bpnpm\s+add\b/i],
+      title: "Dependency install can execute scripts",
+      simple: "Paketinstallation kan köra scripts (postinstall).",
+      dev: "Dependency install detected. npm/yarn/pnpm may run lifecycle scripts; pin versions and disable scripts if possible."
     }
+  ];
+
+  const rulesToUse =
+    pack.enabled === "core"
+      ? CORE_RULES
+      : pack.enabled === "all"
+        ? CORE_RULES
+        : [...CORE_RULES, ...EXTRA_RULES]; // all_plus
+
+  const findings = [];
+  let score = 0;
+
+  for (const r of rulesToUse) {
+    // Whole-text match for trigger
+    const triggered = r.regexes.some((rx) => {
+      try { return rx.test(t); } catch { return false; }
+    });
+    if (!triggered) continue;
+
+    const points = Math.round(r.basePoints * pack.multiplier);
+    score += points;
+
+    const matches = findMatchesByLine(t, r.regexes, 8);
+
+    findings.push({
+      ruleId: r.id,
+      title: r.title,
+      severity: r.severity,
+      points,
+      explainSimple: r.simple,
+      explainDev: r.dev,
+      matches
+    });
   }
 
   score = clamp(score, 0, 100);
-  const risk = computeRisk(score);
+  const risk = computeRisk(score, pack.thresholds);
 
   // Suggested blocklist patterns based on findings
   const suggestedBlocked = [];
@@ -118,43 +243,40 @@ function scanText(text) {
   if (findings.some((f) => f.ruleId === "credential_hunting")) {
     suggestedBlocked.push("cat ~/.ssh/id_rsa", "cat .env", "read ~/.aws/credentials");
   }
-
-  // Extract domains from URLs found in the input
-  const urlMatches = t.match(/\bhttps?:\/\/[^\s'")]+/gi) || [];
-  const extractedDomains = [];
-  for (const u of urlMatches.slice(0, 20)) {
-    try {
-      extractedDomains.push(new URL(u).hostname);
-    } catch {}
+  if (findings.some((f) => f.ruleId === "eval_like")) {
+    suggestedBlocked.push("eval(", "exec(", "Function(");
   }
+
+  const extractedDomains = extractDomainsFromText(t);
 
   const summary =
     risk === "HIGH"
       ? "High-risk patterns detected. Treat as unsafe by default."
       : risk === "MEDIUM"
-      ? "Some risky capabilities detected. Add guardrails and approvals."
-      : "No major red flags detected by heuristics. Still review before running.";
+        ? "Some risky capabilities detected. Add guardrails and approvals."
+        : "No major red flags detected by heuristics. Still review before running.";
 
   return {
     ok: true,
+    pack: pack.name,
+    thresholds: pack.thresholds,
     risk,
     score,
     summary,
-    findings: findings
-      .sort((a, b) => b.points - a.points)
-      .map(({ title, severity, detail }) => ({ title, severity, detail })),
+    findings: findings.sort((a, b) => b.points - a.points),
     suggested: {
       blocklist: { command_patterns: uniq(suggestedBlocked) },
-      allowlist: { domains: normalizeDomains(extractedDomains) }
+      allowlist: { domains: extractedDomains }
     }
   };
 }
 
-function buildPolicy({ suggested, editor }) {
-  // editor defaults
+function buildPolicy({ suggested, editor, packName }) {
+  const pack = getPackConfig(packName);
+
   const network = editor?.network === "allowed" ? "allowed" : "restricted";
   const filesystem = editor?.filesystem === "read_write" ? "read_write" : "read_only";
-  const approvalsEnabled = editor?.approvalsEnabled !== false; // default true
+  const approvalsEnabled = editor?.approvalsEnabled !== false;
   const extraDomains = normalizeDomains(editor?.allowlistDomains || []);
 
   const require_user_approval_for = approvalsEnabled
@@ -162,8 +284,10 @@ function buildPolicy({ suggested, editor }) {
     : [];
 
   return {
-    version: "0.2",
+    version: "0.3",
     mode: "guardrails",
+    rule_pack: pack.name,
+    thresholds: pack.thresholds,
     default: {
       network,
       filesystem,
@@ -177,7 +301,7 @@ function buildPolicy({ suggested, editor }) {
     },
     notes: [
       "This is a suggested policy for an agent runner. Enforce with a sandbox + explicit approvals.",
-      "Prefer domain allowlists; keep network restricted unless you truly need it."
+      "Keep network restricted unless needed; prefer domain allowlists and TLS-only."
     ]
   };
 }
@@ -189,7 +313,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { text, editor } = req.body || {};
+    const { text, editor, pack } = req.body || {};
     if (typeof text !== "string" || text.trim().length === 0) {
       return res.status(400).json({ error: "Missing 'text' (string)." });
     }
@@ -197,8 +321,8 @@ export default async function handler(req, res) {
       return res.status(413).json({ error: "Input too large. Keep it under 200k characters." });
     }
 
-    const scan = scanText(text);
-    const policy = buildPolicy({ suggested: scan.suggested, editor });
+    const scan = scanText(text, pack);
+    const policy = buildPolicy({ suggested: scan.suggested, editor, packName: pack });
 
     return res.status(200).json({
       ...scan,
