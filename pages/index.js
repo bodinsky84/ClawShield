@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import Head from "next/head";
+import Head from "next/head"; 
 
 export default function Home() {
   const [input, setInput] = useState(`# Paste a "skill", prompt, script, or config here…
