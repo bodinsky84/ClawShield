@@ -9,17 +9,25 @@ function computeRisk(score) {
 }
 
 function uniq(arr) {
-  return [...new Set(arr)].filter(Boolean);
+  return [...new Set((arr || []).filter(Boolean))];
+}
+
+function normalizeDomains(list) {
+  return uniq(
+    (list || [])
+      .map((s) => String(s || "").trim())
+      .filter(Boolean)
+      .map((s) => s.replace(/^https?:\/\//i, "").replace(/\/.*$/, ""))
+      .map((s) => s.toLowerCase())
+  );
 }
 
 function scanText(text) {
   const t = String(text || "");
-  const lower = t.toLowerCase();
 
   const findings = [];
   let score = 0;
 
-  // Heuristic rules (MVP)
   const rules = [
     {
       id: "remote_pipe_to_shell",
@@ -27,7 +35,7 @@ function scanText(text) {
       points: 55,
       test: (s) => /\b(curl|wget)\b[\s\S]{0,120}\|\s*(bash|sh|zsh|pwsh|powershell)\b/i.test(s),
       title: "Pipes remote content to a shell",
-      detail: "Patterns like `curl ... | bash` are a common malware delivery mechanism. Prefer downloading + verifying + running locally."
+      detail: "Patterns like `curl ... | bash` are a common malware delivery mechanism. Prefer download + verify + run."
     },
     {
       id: "sudo_or_admin",
@@ -35,7 +43,7 @@ function scanText(text) {
       points: 18,
       test: (s) => /\bsudo\b|runas\b|start-process\b.*-verb\s+runas/i.test(s),
       title: "Uses elevated privileges",
-      detail: "Commands requesting admin rights increase blast radius. Consider a least-privilege sandbox and explicit approval gates."
+      detail: "Admin rights increase blast radius. Prefer least-privilege sandbox and explicit approval gates."
     },
     {
       id: "destructive_rm",
@@ -43,7 +51,7 @@ function scanText(text) {
       points: 45,
       test: (s) => /\brm\s+-rf\b|\bdel\s+\/f\b|\bformat\b|\bmkfs\./i.test(s),
       title: "Potentially destructive delete/format commands",
-      detail: "Detected destructive patterns (e.g. `rm -rf`, `format`, `mkfs`). Block these in agent execution policies."
+      detail: "Detected destructive patterns. Block these in agent execution policies."
     },
     {
       id: "credential_hunting",
@@ -53,7 +61,7 @@ function scanText(text) {
         /\b(openai_api_key|api[_-]?key|secret|token|password)\b/i.test(s) ||
         /~\/\.ssh|id_rsa|authorized_keys|\.aws\/credentials|\.env\b/i.test(s),
       title: "Possible credential or secret access",
-      detail: "Access to `.env`, SSH keys, cloud credentials, or secrets keywords suggests credential-hunting. Require explicit consent and redaction."
+      detail: "Access to `.env`, SSH keys, cloud credentials, or secrets suggests credential-hunting. Require explicit consent + redaction."
     },
     {
       id: "env_dump",
@@ -69,7 +77,7 @@ function scanText(text) {
       points: 16,
       test: (s) => /\b(nc|netcat|socat)\b|\bscp\b|\bcurl\b|\bwget\b|\binvoke-webrequest\b/i.test(s),
       title: "Network-capable commands present",
-      detail: "Network tooling can be used for data exfiltration or downloading payloads. Allowlist domains and restrict outbound network access."
+      detail: "Network tooling can be used for exfiltration or downloading payloads. Prefer domain allowlists."
     },
     {
       id: "code_download_execute",
@@ -77,7 +85,7 @@ function scanText(text) {
       points: 30,
       test: (s) => /\bpython\b[\s\S]{0,40}-c\b|\bnode\b[\s\S]{0,40}-e\b|\bpowershell\b[\s\S]{0,40}-enc\b/i.test(s),
       title: "Inline code execution flags detected",
-      detail: "Flags like `python -c`, `node -e`, or PowerShell encoded commands can hide behavior. Consider blocking or requiring approval."
+      detail: "Inline execution can hide behavior. Consider blocking or requiring approval."
     },
     {
       id: "persistence",
@@ -85,7 +93,7 @@ function scanText(text) {
       points: 16,
       test: (s) => /\b(crontab|launchctl|systemctl\s+enable|schtasks|registry|reg\s+add)\b/i.test(s),
       title: "Possible persistence mechanisms",
-      detail: "Persistence (cron/system services/scheduled tasks/registry changes) should be tightly controlled in any agent runner."
+      detail: "Persistence should be tightly controlled in any agent runner."
     }
   ];
 
@@ -99,57 +107,33 @@ function scanText(text) {
   score = clamp(score, 0, 100);
   const risk = computeRisk(score);
 
-  // Suggested policy (MVP)
-  const suggestedBlockedCommands = [];
-  if (findings.some(f => f.ruleId === "remote_pipe_to_shell")) {
-    suggestedBlockedCommands.push("curl | bash", "wget | bash", "Invoke-WebRequest | powershell");
+  // Suggested blocklist patterns based on findings
+  const suggestedBlocked = [];
+  if (findings.some((f) => f.ruleId === "remote_pipe_to_shell")) {
+    suggestedBlocked.push("curl | bash", "wget | bash", "Invoke-WebRequest | powershell");
   }
-  if (findings.some(f => f.ruleId === "destructive_rm")) {
-    suggestedBlockedCommands.push("rm -rf", "mkfs.*", "format");
+  if (findings.some((f) => f.ruleId === "destructive_rm")) {
+    suggestedBlocked.push("rm -rf", "mkfs.*", "format");
   }
-  if (findings.some(f => f.ruleId === "credential_hunting")) {
-    suggestedBlockedCommands.push("cat ~/.ssh/id_rsa", "cat .env", "read ~/.aws/credentials");
+  if (findings.some((f) => f.ruleId === "credential_hunting")) {
+    suggestedBlocked.push("cat ~/.ssh/id_rsa", "cat .env", "read ~/.aws/credentials");
   }
 
-  const allowedDomains = [];
-  // If we see any URLs, suggest allowlisting rather than open egress
+  // Extract domains from URLs found in the input
   const urlMatches = t.match(/\bhttps?:\/\/[^\s'")]+/gi) || [];
-  if (urlMatches.length) {
-    // keep only hostnames
-    for (const u of urlMatches.slice(0, 10)) {
-      try {
-        const host = new URL(u).hostname;
-        allowedDomains.push(host);
-      } catch {}
-    }
+  const extractedDomains = [];
+  for (const u of urlMatches.slice(0, 20)) {
+    try {
+      extractedDomains.push(new URL(u).hostname);
+    } catch {}
   }
-
-  const policy = {
-    version: "0.1",
-    mode: "guardrails",
-    default: {
-      network: "restricted",
-      filesystem: "read_only",
-      require_user_approval_for: ["write_files", "execute_commands", "network_requests"]
-    },
-    blocklist: {
-      command_patterns: uniq(suggestedBlockedCommands)
-    },
-    allowlist: {
-      domains: uniq(allowedDomains)
-    },
-    notes: [
-      "This is a suggested policy for an agent runner. Enforce with a sandbox + explicit approvals.",
-      "If you must allow network access, prefer domain allowlists and TLS-only."
-    ]
-  };
 
   const summary =
     risk === "HIGH"
       ? "High-risk patterns detected. Treat as unsafe by default."
       : risk === "MEDIUM"
-        ? "Some risky capabilities detected. Add guardrails and approvals."
-        : "No major red flags detected by heuristics. Still review before running.";
+      ? "Some risky capabilities detected. Add guardrails and approvals."
+      : "No major red flags detected by heuristics. Still review before running.";
 
   return {
     ok: true,
@@ -157,9 +141,44 @@ function scanText(text) {
     score,
     summary,
     findings: findings
-      .sort((a, b) => (b.points - a.points))
+      .sort((a, b) => b.points - a.points)
       .map(({ title, severity, detail }) => ({ title, severity, detail })),
-    policy
+    suggested: {
+      blocklist: { command_patterns: uniq(suggestedBlocked) },
+      allowlist: { domains: normalizeDomains(extractedDomains) }
+    }
+  };
+}
+
+function buildPolicy({ suggested, editor }) {
+  // editor defaults
+  const network = editor?.network === "allowed" ? "allowed" : "restricted";
+  const filesystem = editor?.filesystem === "read_write" ? "read_write" : "read_only";
+  const approvalsEnabled = editor?.approvalsEnabled !== false; // default true
+  const extraDomains = normalizeDomains(editor?.allowlistDomains || []);
+
+  const require_user_approval_for = approvalsEnabled
+    ? ["write_files", "execute_commands", "network_requests"]
+    : [];
+
+  return {
+    version: "0.2",
+    mode: "guardrails",
+    default: {
+      network,
+      filesystem,
+      require_user_approval_for
+    },
+    blocklist: {
+      command_patterns: uniq([...(suggested?.blocklist?.command_patterns || [])])
+    },
+    allowlist: {
+      domains: uniq([...(suggested?.allowlist?.domains || []), ...extraDomains])
+    },
+    notes: [
+      "This is a suggested policy for an agent runner. Enforce with a sandbox + explicit approvals.",
+      "Prefer domain allowlists; keep network restricted unless you truly need it."
+    ]
   };
 }
 
@@ -170,17 +189,21 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { text } = req.body || {};
+    const { text, editor } = req.body || {};
     if (typeof text !== "string" || text.trim().length === 0) {
       return res.status(400).json({ error: "Missing 'text' (string)." });
     }
-    // Basic size safety (Vercel/serverless friendly)
     if (text.length > 200_000) {
       return res.status(413).json({ error: "Input too large. Keep it under 200k characters." });
     }
 
-    const result = scanText(text);
-    return res.status(200).json(result);
+    const scan = scanText(text);
+    const policy = buildPolicy({ suggested: scan.suggested, editor });
+
+    return res.status(200).json({
+      ...scan,
+      policy
+    });
   } catch (err) {
     return res.status(500).json({ error: "Internal error.", detail: String(err?.message || err) });
   }
